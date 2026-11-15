@@ -6,10 +6,13 @@
 """
 from __future__ import annotations
 
+import asyncio
+import re
 from typing import Any, AsyncIterator
 
 from .. import config
-from ..llm import ArtifactStore, complete_json, run_agent
+from ..llm import ArtifactStore, complete_json, complete_json_diagnostic, run_agent
+from ..model_lab.defaults import DEFAULT_PLANNING_OUTPUT_TOKENS, DEFAULT_STRUCTURED_OUTPUT_TOKENS
 from .evidence_navigator import EvidenceNavigator
 from .research_context import ResearchContext
 from ..skills.evidence_graph import (
@@ -19,6 +22,7 @@ from ..skills.evidence_graph import (
 from .roster import AGENTS, get_agent, system_prompt
 
 EXPERT_IDS = ["event_scout", "market_analyst", "fundamentals_analyst", "deep_researcher", "predictor"]
+HYPOTHESIS_TIMEOUT_SECONDS = 45.0
 
 # ======================================================================
 # Pronoia-RLVR v1 · Tier 1.5 接入预留（design §3.3.1 / §3.4 · 先训练后接入）
@@ -37,6 +41,31 @@ RLVR_ANALYZER_INSTRUCTION_IF_ENABLED = """【Tier 1.5 · Pronoia-RLVR 可验证�
 - 只把【0.预判时间窗口】【0.5 量价 regime 校验】两段的数值，以及最终方向 +
   置信度 + RET↔CAR 一致标志拼进 synthesis；不整段复制避免污染。
 - 若 ENABLE_RLVR_TIER15=False，则本节静默跳过，不影响默认 Team Pipeline 行为。"""
+
+# Team mode is also used by the historical event backtester.  That caller must
+# explicitly opt into this point-in-time-safe subset so generic research agents
+# cannot fetch current news, prices, financials or holder data during a replay.
+STRICT_BACKTEST_SKILL_ALLOWLIST = frozenset({
+    "event_study_skill",
+    "announcement_classifier",
+    "ar_decomposer",
+    "drift_context_analyzer",
+    "evidence_graph",
+})
+
+
+def _agent_def_with_skill_allowlist(
+    agent_id: str,
+    skill_allowlist: set[str] | frozenset[str] | None,
+) -> dict[str, Any]:
+    """Copy an agent definition and optionally restrict its callable skills."""
+    agent_def = dict(get_agent(agent_id))
+    if skill_allowlist is not None:
+        agent_def["skills"] = [
+            skill for skill in (agent_def.get("skills") or [])
+            if str(skill) in skill_allowlist
+        ]
+    return agent_def
 
 PLANNER_INSTRUCTION = """你是任务规划器。把用户问题拆成 2~4 个子任务，每个子任务指定一个专家 Agent：
 - event_scout（事件猎手：新闻/公告/快讯检索，筛高影响事件）
@@ -139,7 +168,7 @@ def _inject_event_skill_defaults(
     no target symbol (571 failures in the 1000-sample trajectory).
     """
     normalized = dict(args or {})
-    if name != "event_study_skill" or not event_meta:
+    if name not in {"event_study_skill", "frozen_announcement_fetch"} or not event_meta:
         return normalized
     if not normalized.get("symbol") and not normalized.get("keyword"):
         symbol = str(event_meta.get("symbol") or "").strip()
@@ -149,6 +178,12 @@ def _inject_event_skill_defaults(
         event_date = str(event_meta.get("event_time") or "").strip()[:10]
         if event_date:
             normalized["event_date"] = event_date
+    fields = ("source_url", "source_key", "market", "issuer_name") if name == "frozen_announcement_fetch" else ("prediction_cutoff_at", "market")
+    for key in fields:
+        if not normalized.get(key) and event_meta.get(key):
+            normalized[key] = event_meta[key]
+    if name == "frozen_announcement_fetch":
+        return normalized
     if not normalized.get("benchmark"):
         benchmark = str(event_meta.get("benchmark") or "").strip()
         if benchmark:
@@ -255,10 +290,16 @@ async def _run_expert_serial(
     export_graph: bool = True,
     agent_def: dict | None = None,
     max_rounds: int | None = None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+    packet_only: bool = False,
     external_skill_budget: int | None = None,
     extra_context: str = "",
     event_meta: dict | None = None,
     prior_conversation: str = "",
+    skill_allowlist: set[str] | frozenset[str] | None = None,
+    frozen_event_meta: dict[str, Any] | None = None,
+    forecast_contract: str | None = None,
 ) -> AsyncIterator[dict]:
     """单 expert 串行执行：agent_start → events → agent_done 收尾。失败也收尾。
 
@@ -277,7 +318,7 @@ async def _run_expert_serial(
         token = eg_attach(graph)
         graph_export_token = eg_defer_export_artifact(not export_graph)
     try:
-        if agent_id == "predictor" and prior_findings:
+        if agent_id == "predictor" and prior_findings and not forecast_contract:
             findings = (
                 "深度研究证据图已完成交接。事件预测员在团队流程中只协调独立的后台多智能体推演，"
                 "不在聊天阶段重复取数、等待任务或预先编造模拟结论。系统仅在证据图通过入口校验时"
@@ -325,11 +366,17 @@ async def _run_expert_serial(
                     "不得把模拟判断写成已观察证据。\n\n"
                     + "\n\n".join(digest_blocks)
                 )
+        source_instruction = (
+            "只基于用户原始问题中的冻结 as_of_packet 作答；不要调用工具。"
+            "最后用不超过400字总结发现，逐条区分事实、推断与缺口。"
+            if packet_only else
+            "请调用你的技能获取真实数据后作答；最后用不超过600字总结发现（含关键数字+来源）。"
+        )
         messages = [
             {"role": "system", "content": system_prompt(agent_id, prompt_variant)},
             {"role": "user", "content":
                 f"【用户原始问题】{question}\n\n【你的子任务】{task_text}\n\n"
-                "请调用你的技能获取真实数据后作答；最后用不超过600字总结发现（含关键数字+来源）。"
+                + source_instruction
                 + prior_conversation
                 + evidence_context
                 + (f"\n\n【Evidence Navigator 图谱上下文】\n{extra_context}" if extra_context else "")},
@@ -338,7 +385,46 @@ async def _run_expert_serial(
 
         async def team_skill_executor(name: str, args: dict) -> dict:
             nonlocal external_skill_calls
-            args = _inject_event_skill_defaults(name, args, event_meta)
+            safe_args = _inject_event_skill_defaults(name, args, event_meta)
+            if skill_allowlist is not None and name not in skill_allowlist:
+                # Tool schemas are advisory input to the model, not a security
+                # boundary.  Enforce the historical-replay allowlist again at
+                # execution time so an undeclared/hallucinated call can never
+                # reach a live market, news or fundamentals handler.
+                return {
+                    "ok": False,
+                    "code": "skill_not_allowed_in_historical_replay",
+                    "error": f"严格历史回放禁止调用技能: {name}",
+                }
+            safe_args = dict(safe_args or {})
+            if skill_allowlist is not None and name in {"event_study_skill", "event_study"}:
+                # Do not rely on process-global environment state: any restricted
+                # team replay forces the immutable event identity and the
+                # point-in-time view again at the executor edge.
+                safe_args["as_of"] = True
+                if frozen_event_meta:
+                    market = str(frozen_event_meta.get("market") or "").strip().upper()
+                    raw_time = (
+                        frozen_event_meta.get("available_time")
+                        or frozen_event_meta.get("event_time")
+                    )
+                    try:
+                        from ..event_backtest.evaluation_protocol import parse_event_datetime
+
+                        parsed = parse_event_datetime(
+                            raw_time,
+                            market=market,
+                            field_name="available_time/event_time",
+                        )
+                        event_date = parsed.date().isoformat() if parsed is not None else str(raw_time or "")[:10]
+                    except ValueError:
+                        event_date = str(raw_time or "")[:10]
+                    safe_args.update({
+                        "event_date": event_date,
+                        "symbol": str(frozen_event_meta.get("symbol") or "").strip(),
+                        "market": market,
+                        "benchmark": str(frozen_event_meta.get("benchmark") or "cash").strip(),
+                    })
             if name != "evidence_graph" and external_skill_budget is not None:
                 if external_skill_calls >= external_skill_budget:
                     return {
@@ -351,12 +437,22 @@ async def _run_expert_serial(
                 external_skill_calls += 1
             if research_context is None:
                 from ..llm import execute_skill
-                return await execute_skill(name, args)
+                return await execute_skill(name, safe_args)
             from ..llm import execute_skill
-            return await research_context.execute(execute_skill, name, args)
+            return await research_context.execute(execute_skill, name, safe_args)
 
+        if forecast_contract and agent_id == "predictor":
+            messages[0]["content"] = (
+                "你是前瞻收益预测专家。基于前序专家和证据图进行情景分析，给出相对基准的未来表现判断。"
+                "这次任务直接交付前瞻预测，不启动、不协调、不等待独立推演服务。" + forecast_contract
+            )
         resolved_agent_def = agent_def or get_agent(agent_id, prompt_variant)
-        if agent_id == "deep_researcher" and prior_findings:
+        if packet_only:
+            # The sealed replay packet already contains the only admissible
+            # source facts. Re-fetching the same local event-study tables adds
+            # cost without evidence and can tempt the model to overfit them.
+            resolved_agent_def = {**resolved_agent_def, "skills": []}
+        elif agent_id == "deep_researcher" and prior_findings:
             # Source experts have already fetched the evidence and the graph is
             # pre-seeded above. Keeping all seven data skills available caused
             # the model to fetch the same tables again and run out of graph
@@ -367,10 +463,25 @@ async def _run_expert_serial(
             # multi-agent run starts asynchronously from the exported graph, so
             # repeating source data calls here only delays that handoff.
             resolved_agent_def = {**resolved_agent_def, "skills": []}
+        if skill_allowlist is not None:
+            resolved_agent_def = {
+                **resolved_agent_def,
+                "skills": [
+                    skill
+                    for skill in (resolved_agent_def.get("skills") or [])
+                    if str(skill) in skill_allowlist
+                ],
+            }
+        agent_limits: dict[str, Any] = {}
+        if max_tokens is not None:
+            agent_limits["max_tokens"] = max_tokens
+        if reasoning_effort is not None:
+            agent_limits["reasoning_effort"] = reasoning_effort
         async for ev in run_agent(agent_id, messages, agent_def=resolved_agent_def,
                                   state=expert_state, artifact_store=artifact_store,
                                   skill_executor=team_skill_executor,
-                                  max_rounds=max_rounds or config.TEAM_MAX_ROUNDS):
+                                  max_rounds=max_rounds or config.TEAM_MAX_ROUNDS,
+                                  **agent_limits):
             yield ev
         findings = expert_state["content"].strip()
         # deep_researcher 收尾：若 LLM 没显式 export，把当前图强制导出为图谱 artifact
@@ -402,13 +513,15 @@ async def _run_expert_serial(
                         yield {"type": "token", "agent": agent_id, "delta": tail}
                         expert_state["content"] += tail
             except Exception as e:  # noqa: BLE001
-                yield {"type": "thinking", "agent": agent_id,
-                       "delta": f"\n[deep_researcher 导出图谱失败: {type(e).__name__}: {e}]\n"}
+                yield {"type": "agent_step", "phase": "progress", "agent": agent_id,
+                       "note": f"导出证据图失败：{type(e).__name__}"}
         yield {"type": "agent_step", "phase": "agent_done", "agent": agent_id,
                "note": _short_summary(findings)}
         yield {"type": "agent_findings", "agent": agent_id, "findings": findings[:600],
                "tool_trace": expert_state["tool_trace"]}
     except Exception as e:  # noqa: BLE001
+        if forecast_contract:
+            raise
         findings = f"（{agent_id} 执行失败: {type(e).__name__}: {e}）"
         yield {"type": "agent_step", "phase": "agent_done", "agent": agent_id,
                "note": "执行失败"}
@@ -766,6 +879,9 @@ async def run_team(
     skip_verify: bool = False,
     event_meta: dict | None = None,
     agent_prompt_variants: dict[str, str] | None = None,
+    skill_allowlist: set[str] | frozenset[str] | None = None,
+    forecast_contract: str | None = None,
+    bounded_full: bool = False,
 ) -> AsyncIterator[dict]:
     """Yield SSE events for the whole team-mode flow. state['content'] = final answer.
 
@@ -776,7 +892,22 @@ async def run_team(
     event_meta: 事件元信息（market, event_type_l2, symbol, benchmark 等），
                 用于 Synthesize 阶段路由到对应 Tier 1 analyzer skill。
     agent_prompt_variants: 按 agent_id 指定 persona 变体；回测 A/B 当前用于 deep_researcher。
+    skill_allowlist: 可调用 skill 的白名单；严格历史回测传入安全子集，
+                     ``None`` 保持普通研究工作台的完整能力。
     """
+    from ..evolution.runtime import prompt_context
+    question += prompt_context()
+
+    async def team_json(system: str, user: str, *, max_tokens: int) -> dict | None:
+        if not bounded_full:
+            return await complete_json(system, user, max_tokens=max_tokens)
+        result = await complete_json_diagnostic(
+            system,
+            user,
+            max_tokens=max_tokens,
+            reasoning_effort="none",
+        )
+        return result.value
     # ------------------------------------------------------------ 1) plan --
     # 构建历史上下文摘要（最近 3 轮），让 router 知道之前聊了什么
     history_ctx = ""
@@ -789,12 +920,12 @@ async def run_team(
 
     plan: list[dict] = []
     try:
-        yield {"type": "thinking", "agent": "router",
-               "delta": "正在拆解研究任务，规划专家分工…"}
-        plan_json = await complete_json(
+        yield {"type": "agent_step", "phase": "progress", "agent": "router",
+               "note": "正在拆解研究任务，规划专家分工…"}
+        plan_json = await team_json(
             system_prompt("router") + "\n\n" + PLANNER_INSTRUCTION,
             f"用户问题：{question}{history_ctx}",
-            max_tokens=2000,
+            max_tokens=4096 if bounded_full else DEFAULT_PLANNING_OUTPUT_TOKENS,
         )
         if plan_json:
             for t in plan_json.get("tasks", []):
@@ -803,6 +934,8 @@ async def run_team(
                 if aid in EXPERT_IDS and task_text and all(p["agent"] != aid for p in plan):
                     plan.append({"agent": aid, "task": task_text})
     except Exception:  # noqa: BLE001
+        if forecast_contract:
+            raise
         plan = []
     if not plan:  # fallback：行情+基本面双视角 + deep_researcher 必派
         plan = [
@@ -841,6 +974,16 @@ async def run_team(
             plan = [{"agent": "deep_researcher", "task":
                      f"围绕「{question}」直接沉淀到证据图：每条关键数字作为 evidence，"
                      f"每条可证伪推断作为 claim，最后 export"}]
+        if bounded_full and "fundamentals_analyst" in allow and not any(
+            p["agent"] == "fundamentals_analyst" for p in plan
+        ):
+            plan.append({
+                "agent": "fundamentals_analyst",
+                "task": (
+                    "仅根据冻结 as_of_packet 提取公告与财务事实，分析其对目标窗口"
+                    "相对基准方向的影响，并明确资料缺口"
+                ),
+            })
     # Source-oriented experts run first, graph synthesis follows, and predictor
     # receives that handoff last. This prevents simulated forecasts from being
     # seeded back into the evidence graph as if they were observations.
@@ -869,8 +1012,8 @@ async def run_team(
     team_graph: EvidenceGraph | None = None
     total_experts = len(plan)
     for ei, p in enumerate(plan):
-        yield {"type": "thinking", "agent": "router",
-               "delta": f"正在调度第 {ei+1}/{total_experts} 位专家：{AGENTS.get(p['agent'], {}).get('name', p['agent'])}…"}
+        yield {"type": "agent_step", "phase": "progress", "agent": "router",
+               "note": f"正在调度第 {ei+1}/{total_experts} 位专家：{AGENTS.get(p['agent'], {}).get('name', p['agent'])}…"}
         is_deep_researcher = p["agent"] == "deep_researcher"
         if is_deep_researcher:
             # Keep this graph alive through the Navigator's verification pass.
@@ -896,6 +1039,13 @@ async def run_team(
             graph=team_graph if is_deep_researcher else None,
             export_graph=not is_deep_researcher,
             prior_conversation=history_ctx,
+            skill_allowlist=skill_allowlist,
+            frozen_event_meta=event_meta,
+            forecast_contract=forecast_contract,
+            max_rounds=(1 if bounded_full and not is_deep_researcher else 2) if bounded_full else None,
+            max_tokens=2048 if bounded_full else None,
+            reasoning_effort="none" if bounded_full else None,
+            packet_only=bounded_full and not is_deep_researcher,
         ):
             # 提取 agent_findings 写入 state + findings；其余原样 yield
             if ev.get("type") == "agent_findings":
@@ -911,7 +1061,7 @@ async def run_team(
     # Argus-style loop, deliberately bounded in this first implementation:
     # observe the shared graph → dispatch one targeted follow-up → observe
     # again.  No free-form retries and no unbounded fan-out.
-    if (team_graph is not None and config.EVIDENCE_NAVIGATOR_ENABLED
+    if (team_graph is not None and not bounded_full and config.EVIDENCE_NAVIGATOR_ENABLED
             and config.EVIDENCE_NAVIGATOR_MAX_ROUNDS > 0):
         navigator = EvidenceNavigator(
             max_dispatches=config.EVIDENCE_NAVIGATOR_MAX_DISPATCHES,
@@ -957,6 +1107,8 @@ async def run_team(
                     external_skill_budget=config.EVIDENCE_NAVIGATOR_EXTERNAL_SKILL_BUDGET,
                     extra_context=graph_context,
                     event_meta=event_meta,
+                    skill_allowlist=skill_allowlist,
+                    frozen_event_meta=event_meta,
                 ):
                     if ev.get("type") == "agent_findings":
                         followup = str(ev.get("findings") or "").strip()
@@ -1005,8 +1157,8 @@ async def run_team(
                     f"；Navigator 审计发现 {payload['audit']['summary']['total_findings']} 项待处理。")
             findings["deep_researcher"] = (findings.get("deep_researcher", "") + tail).strip()
         except Exception as e:  # noqa: BLE001
-            yield {"type": "thinking", "agent": "deep_researcher",
-                   "delta": f"\n[最终证据图导出失败: {type(e).__name__}: {e}]\n"}
+            yield {"type": "agent_step", "phase": "progress", "agent": "deep_researcher",
+                   "note": f"导出最终证据图失败：{type(e).__name__}"}
 
     # ---------------------------------------------------------- 3) synthesize
     # 信号路由：调用 Tier 1 analyzer 产出结构化 scorecard，注入 synthesize prompt
@@ -1062,11 +1214,37 @@ async def run_team(
             "请将其作为重要参考——如果分析师团队发现中的信号与结构化分析一致，提高 confidence；"
             "如果不一致，请仔细检查是否遗漏了关键信号（如出尽效应、被动AR等）。"
             "结构化分析的净分方向应有较高权重。"
-            "\n【neutral 约束（必须遵守）】 neutral 仅用于 |T+3 CAR|<50bps 的纯噪声事件（即方向完全随机）。"
-            "在以下情况才允许判 neutral：①结构化分析的 |净分|<1.0 且无任何一条信号强度≥2；②存在 ≥2 条方向相反且力度相当的矛盾证据；③关键价格数据/公告数值完全缺失。"
-            "否则必须在 up / down 中给出明确方向，不要用 neutral 逃避判断。"
+            "\n【输出约束】分析器的 neutral 仅表示内部信号未形成方向，不是最终预测。"
+            "资料足以判断时仅输出 up 或 down；关键资料缺失无法支持判断时明确输出 insufficient_data（数据不足）并列出缺失信息。"
+            "不要把缺失数值当作零，也不要把低置信度或分析器净分接近零自动转换成中性预测。"
         )
 
+    # Only historical event prediction has a direction parser. Ordinary team
+    # research (including Model Lab QA) must fulfill the original question.
+    if forecast_contract:
+        task_output_instruction = forecast_contract
+    elif event_meta:
+        task_output_instruction = (
+            "【预测状态】资料足以判断时输出 available，仅允许 up 或 down。"
+            "关键事实、公告数值或必要事前行情缺失，无法支持判断时输出 insufficient_data，"
+            "最终方向、置信度与预期收益率均为 null，并在中文理由中列出具体缺失资料。"
+            "【neutral 约束】不输出 neutral，不强猜缺失数据，不因置信度低而改变已有方向，"
+            "不设置各方向或弃权比例目标。"
+            "输出格式要求（与 parser 对齐，必须严格包含中文标签行）：\n"
+            "【预测状态】 available 或 insufficient_data\n"
+            "【最终方向】 up 或 down；数据不足时 null\n"
+            "【置信度】 0 到 1；数据不足时 null\n"
+            "【中文理由】 不超过 300 字，列举关键证据或具体缺失资料\n"
+            "【预期收益率】 数值或 null；数据不足时必须为 null。"
+            "专家文字中没有对应工具证据的数字不得继承为事实。事件预测员的后台推演尚未作为"
+            "本轮聊天输入返回，不得声称已经看到模拟结果；quick 单次推演不得输出百分比概率，"
+            "只能使用高/中/低等未校准的相对倾向。"
+        )
+    else:
+        task_output_instruction = (
+            "请逐项完成用户原始问题要求的分析和交付内容，保留必要的数据、公式、来源、"
+            "事实与推断的区分，以及资料缺口。篇幅以完整回答问题为准。"
+        )
     synth_messages = [{"role": "system", "content": system_prompt("router")}]
     synth_messages.extend(history)
     synth_messages.append({
@@ -1077,25 +1255,18 @@ async def run_team(
             f"{analyzer_context}\n\n"
             "请综合以上专家发现，给出结构化的最终回答（先结论后依据，标注来源与推断）。"
             "【重要】不要调用任何工具！专家已经查过所有数据。你必须直接输出文字回答，不要 function/tool call。"
-            "【neutral 约束（必须遵守）】 neutral 仅用于以下严格条件："
-            "(a) T+3 方向信号极弱（|CAR|预计<50bps，方向纯噪声）；"
-            "(b) 存在 ≥2 条方向相反且力度相当的矛盾证据；"
-            "(c) 关键价格数据/公告数值完全缺失无法判断。"
-            "否则必须在 up / down 中给出明确方向，不要用 neutral 逃避判断。"
-            "输出格式要求（与 parser 对齐，必须严格包含中文标签行）：\n"
-            "【最终方向】 up / down / neutral 三选一\n"
-            "【置信度】 0.xx（0.50-0.99）\n"
-            "【中文理由】 不超过 300 字，列举 2-4 条关键支撑信号。"
-            "专家文字中没有对应工具证据的数字不得继承为事实。事件预测员的后台推演尚未作为"
-            "本轮聊天输入返回，不得声称已经看到模拟结果；quick 单次推演不得输出百分比概率，"
-            "只能使用高/中/低等未校准的相对倾向。"
+            f"{task_output_instruction}"
         ),
     })
     # synthesize 阶段：禁用所有 skill，强制纯文字总结，避免 deepseek-v4-flash 发起无意义 tool call 导致 max_rounds 耗尽 content 为空
     synth_agent_def = {**get_agent("router"), "skills": []}
+    synth_limits = (
+        {"max_tokens": 2048, "reasoning_effort": "none"}
+        if bounded_full else {}
+    )
     async for ev in run_agent("router", synth_messages, agent_def=synth_agent_def,
                               state=state, artifact_store=artifact_store,
-                              max_rounds=2):
+                              max_rounds=2, **synth_limits):
         yield ev
 
     state["tool_trace"].append({"type": "research_context", **research_context.stats()})
@@ -1105,15 +1276,30 @@ async def run_team(
     if draft and not skip_verify:
         try:
             evidence = _evidence_digest(state["tool_trace"])
-            yield {"type": "thinking", "agent": "verifier",
-                   "delta": "正在复核研究结论的事实性与逻辑一致性…"}
-            verdict_json = await complete_json(
+            packet_evidence = ""
+            if bounded_full and event_meta:
+                packet_evidence = (
+                    "\n\n【冻结 as_of_packet（权威事前证据）】\n"
+                    f"标题：{str(event_meta.get('title') or '')[:300]}\n"
+                    f"公告正文：{str(event_meta.get('event_text') or '')[:3000]}\n"
+                    f"事前特征：{str(event_meta.get('pre_event_features') or {})[:1500]}\n"
+                    "冻结包中的原文和事前特征可直接核验，不要求另有工具调用记录。"
+                )
+            yield {"type": "agent_step", "phase": "progress", "agent": "verifier",
+                   "note": "正在复核研究结论的事实性与逻辑一致性…"}
+            verdict_json = await team_json(
                 system_prompt("verifier"),
-                f"【分析草稿】\n{draft[:4000]}\n\n【证据摘要（工具调用记录）】\n{evidence}",
-                max_tokens=3000,
+                f"【分析草稿】\n{draft if forecast_contract else draft[:4000]}\n\n【证据摘要（工具调用记录）】\n{evidence}"
+                + packet_evidence
+                + ("\n【本次预测约束】\n" + forecast_contract if forecast_contract else ""),
+                max_tokens=4096 if bounded_full else DEFAULT_STRUCTURED_OUTPUT_TOKENS,
             )
         except Exception:  # noqa: BLE001
+            if forecast_contract:
+                raise
             verdict_json = None
+        if forecast_contract and (not isinstance(verdict_json, dict) or verdict_json.get("verdict") not in {"pass", "issues"}):
+            raise ValueError("前瞻团队复核未完成，未发布预测")
         verdict = "pass"
         issues: list[str] = []
         corrected = ""
@@ -1121,6 +1307,8 @@ async def run_team(
             verdict = str(verdict_json.get("verdict") or "pass")
             issues = [str(i) for i in (verdict_json.get("issues") or [])][:5]
             corrected = str(verdict_json.get("corrected") or "")
+        if forecast_contract and verdict == "issues" and not issues:
+            raise ValueError("前瞻团队复核结果不完整，未发布预测")
         note = "；".join(issues)[:300] if issues else "未发现事实性错误"
         yield {"type": "agent_step", "phase": "verified", "agent": "verifier",
                "note": f"verdict={verdict} · {note}"}
@@ -1130,20 +1318,25 @@ async def run_team(
             fix_messages = [
                 {"role": "system", "content": system_prompt("router")},
                 {"role": "user", "content": (
-                    f"【你的草稿】\n{draft[:3000]}\n\n"
+                    f"【你的草稿】\n{draft if forecast_contract else draft[:3000]}\n\n"
                     f"【复核员意见】\n问题：{note}\n修正建议：{corrected[:1500]}\n\n"
                     "请直接输出修正后的关键内容（先一句话承认并更正问题，再给出修正后的关键段落）。"
                     "不要重复外层已注入的「## 复核修正」标题；开头不要以 # 标题开头，"
-                    "直接以陈述句或「经核实…」之类的过渡句起笔即可。")},
+                    "直接以陈述句或「经核实…」之类的过渡句起笔即可。"
+                    + ("\n务必同时输出修正后的完整预测 JSON，不得沿用草稿中的过期结论。\n" + forecast_contract if forecast_contract else ""))},
             ]
             fix_state: dict[str, Any] = {"content": "", "tool_trace": state["tool_trace"]}
             header = "\n\n## 复核修正\n"
             state["content"] += header
             yield {"type": "token", "agent": "router", "delta": header}
+            fix_limits = (
+                {"max_tokens": 2048, "reasoning_effort": "none"}
+                if bounded_full else {}
+            )
             async for ev in run_agent("router", fix_messages,
                                       agent_def={**get_agent("router"), "skills": []},
                                       state=fix_state, artifact_store=artifact_store,
-                                      max_rounds=1, emit_thinking=False):
+                                      max_rounds=1, **fix_limits):
                 if ev.get("type") == "token":
                     delta = ev["delta"]
                     # 兜底：若 LLM 仍以 ## 复核修正 开头，剥掉首个重复标题
@@ -1157,36 +1350,80 @@ async def run_team(
                     state["content"] += delta
                 yield ev
 
+            if forecast_contract and not re.search(r"```(?:json)?\s*\{", fix_state.get("content", ""), re.I):
+                raise ValueError("前瞻复核修正未返回更新后的预测 JSON，未发布预测")
+
     # -------------------------------------------------- 5) extract hypotheses
-    import time as _t
     final_answer = state["content"].strip()
     if final_answer and not skip_hypothesis:
-        try:
-            yield {"type": "thinking", "agent": "router",
-                   "delta": "正在提炼可证伪的研究假设…"}
-            extracted = await complete_json(
+        async for event in _extract_hypotheses(
+            question, final_answer, state, bounded_full=bounded_full,
+        ):
+            yield event
+
+
+async def _extract_hypotheses(
+    question: str, final_answer: str, state: dict, *, bounded_full: bool = False,
+) -> AsyncIterator[dict]:
+    """Optional post-processing always reports a terminal state to the UI."""
+    import time
+
+    yield {"type": "agent_step", "phase": "hypotheses", "agent": "router",
+           "verdict": "running", "note": "正在提炼可证伪的研究假设…"}
+    items: list[dict] = []
+    verdict = "failed"
+    note = "研究假设提炼未完成，研究正文已保留。"
+    try:
+        completion = (
+            complete_json_diagnostic(
+                system_prompt("router") + "\n\n" + HYPOTHESIS_EXTRACT_INSTRUCTION,
+                f"用户原始问题：{question}\n\n【研究结论】\n{final_answer[:3500]}",
+                max_tokens=4096,
+                reasoning_effort="none",
+            )
+            if bounded_full else
+            complete_json(
                 system_prompt("router") + "\n\n" + HYPOTHESIS_EXTRACT_INSTRUCTION,
                 f"用户原始问题：{question}\n\n【研究结论】\n{final_answer[:3500]}",
                 max_tokens=2000,
             )
-        except Exception:  # noqa: BLE001
-            extracted = None
-        items: list[dict] = []
-        if extracted:
-            for j, it in enumerate((extracted.get("items") or [])[:5]):
-                h = str(it.get("hypothesis") or "").strip()
-                if not h:
-                    continue
-                items.append({
-                    "id": f"h{int(_t.time() * 1000) % 1_000_000}_{j}",
-                    "hypothesis": h[:300],
-                    "category": str(it.get("category") or "").strip()[:30],
-                    "probability": str(it.get("probability") or "").strip()[:20],
-                    "scope": str(it.get("scope") or "").strip()[:80],
-                    "horizon": str(it.get("horizon") or "").strip()[:50],
-                    "check": str(it.get("check") or "").strip()[:200],
-                })
-        if items:
-            yield {"type": "logic_items", "items": items}
-            state["tool_trace"].append({"type": "logic_items", "count": len(items),
-                                        "items": items})
+        )
+        completed = await asyncio.wait_for(
+            completion,
+            timeout=HYPOTHESIS_TIMEOUT_SECONDS,
+        )
+        extracted = completed.value if bounded_full else completed
+        if not isinstance(extracted, dict) or not isinstance(extracted.get("items"), list):
+            raise ValueError("invalid hypothesis response")
+        for j, it in enumerate(extracted["items"][:5]):
+            if not isinstance(it, dict):
+                continue
+            h = str(it.get("hypothesis") or "").strip()
+            if not h:
+                continue
+            items.append({
+                "id": f"h{int(time.time() * 1000) % 1_000_000}_{j}",
+                "hypothesis": h[:300],
+                "category": str(it.get("category") or "").strip()[:30],
+                "probability": str(it.get("probability") or "").strip()[:20],
+                "scope": str(it.get("scope") or "").strip()[:80],
+                "horizon": str(it.get("horizon") or "").strip()[:50],
+                "check": str(it.get("check") or "").strip()[:200],
+            })
+        if extracted["items"] and not items:
+            raise ValueError("no valid hypothesis items")
+        verdict = "completed" if items else "empty"
+        note = f"已提炼 {len(items)} 条待验证假设。" if items else "研究假设提炼完成，本轮未新增可独立验证的条目。"
+    except asyncio.TimeoutError:
+        verdict = "timeout"
+        note = "研究假设提炼超时，已停止此步骤；研究正文已保留。"
+    except Exception:  # noqa: BLE001 — optional extraction must not discard the answer
+        pass
+    if items:
+        event = {"type": "logic_items", "items": items}
+        state["tool_trace"].append({**event, "count": len(items)})
+        yield event
+    terminal = {"type": "agent_step", "phase": "hypotheses", "agent": "router",
+                "verdict": verdict, "note": note}
+    state["tool_trace"].append(terminal)
+    yield terminal

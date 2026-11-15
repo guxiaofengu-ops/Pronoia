@@ -27,7 +27,7 @@ import re
 from typing import Any
 
 from ..llm import execute_skill
-from .market import is_a_share_index_symbol, is_us_symbol
+from .market import is_a_share_index_symbol, is_us_symbol, norm_symbol
 from .price_data import resolve_security_ref
 from .registry import err, meta, ok, skill
 
@@ -490,6 +490,9 @@ async def news_intel(symbol: str | None = None,
     raw_symbol = (symbol or "").strip()
     us_stock = bool(raw_symbol) and is_us_symbol(raw_symbol)
     code = "".join(ch for ch in raw_symbol if ch.isdigit())[-6:] if raw_symbol else ""
+    # limit 封顶 20：底层 llm_web_latest 内部上限即为 20，更大的请求只
+    # 会得到相同结果（还会破坏同参缓存去重），统一收敛到同一取值。
+    limit = max(1, min(int(limit or 8), 20))
     kind = kind or (["news", "announcement"] if code else ["global"])
     tasks: list[tuple[str, dict]] = []
     notes: list[str] = []
@@ -650,7 +653,7 @@ async def macro_intel(topic: str | None = None) -> dict:
     "事件研究：基于 event_study 子能力，分析单次事件前后的异常收益（CAR）。"
     "event_date YYYY-MM-DD，symbol 支持 6 位 A 股代码或美股 ticker（AAPL/NVDA/TSLA）。"
     "如果传 keyword 而无 symbol，先用 search_stock 解析（自动识别美股/ A 股）。"
-    "window_days 默认 30；回测/严格 as-of 场景请传 as_of=True，此时仅返回事件日前数据（禁止未来函数）。",
+    "window_days 默认 30；回测/严格 as-of 场景请传 as_of=True，此时仅返回事件日前一交易日收盘及更早数据（禁止未来函数）。",
     {
         "type": "object",
         "properties": {
@@ -661,8 +664,10 @@ async def macro_intel(topic: str | None = None) -> dict:
             "window_days": {"type": "integer", "description": "事件窗口，默认 30"},
             "benchmark": {"type": "string",
                           "description": "基准指数/ETF：A 股传 sh000300 等；美股传 SPY/QQQ/XLK 等（优先使用调用方指定）"},
+            "market": {"type": "string",
+                       "description": "事件声明市场；严格回放时由执行边界冻结"},
             "as_of": {"type": "boolean",
-                      "description": "严格 as-of 回测模式：True=只返回事件日及以前数据（禁止未来函数，不返回 post-event CAR）"},
+                      "description": "严格 as-of 回测模式：True=只返回事件日前一交易日收盘及更早数据（不返回 T0 或 post-event 信息）"},
         },
         "required": ["event_date"],
         "anyOf": [
@@ -678,9 +683,16 @@ async def event_study_skill(event_date: str, symbol: str | None = None,
                             keyword: str | None = None,
                             window_days: int = 30,
                             benchmark: str | None = None,
-                            as_of: bool = False) -> dict:
+                            as_of: bool = False,
+                            market: str | None = None,
+                            prediction_cutoff_at: str | None = None) -> dict:
     sym_raw = (symbol or "").strip()
-    us = bool(sym_raw) and is_us_symbol(sym_raw)
+    declared_market = str(market or "").strip().upper()
+    if declared_market and declared_market not in {"CN", "US"}:
+        return err(f"event_study_skill 暂不支持 {declared_market} 市场")
+    us = declared_market == "US" or (
+        not declared_market and bool(sym_raw) and is_us_symbol(sym_raw)
+    )
     if us:
         # 美股：保留原始 ticker（去空白 / 大写），如 AAPL / BRK.B
         sym = sym_raw.upper()
@@ -688,20 +700,11 @@ async def event_study_skill(event_date: str, symbol: str | None = None,
         # A 股指数：保留 sh000300 / sz399001 形式，不能截成 6 位股票代码
         sym = sym_raw.lower()
     elif sym_raw:
-        # A 股：保留显式交易所前缀；若只有 6 位代码，则在这里补正确前缀。
-        # 不能先剥 SH/SZ 再交给下游，否则 51/56/58 开头的沪市 ETF 会被误判为深市。
-        code6 = "".join(ch for ch in sym_raw if ch.isdigit())[-6:]
-        if len(code6) == 6:
-            lowered = sym_raw.lower()
-            if lowered.startswith(("sh", "sz", "bj")):
-                sym = lowered[:2] + code6
-            elif code6.startswith(("50", "51", "52", "56", "58")):
-                sym = "sh" + code6
-            elif code6.startswith("15"):
-                sym = "sz" + code6
-            else:
-                sym = code6
-        else:
+        # Preserve explicit exchange aliases while resolving bare A-share,
+        # ETF, index, and Beijing codes through the shared normalizer.
+        try:
+            sym = norm_symbol(sym_raw)
+        except ValueError:
             sym = ""
     else:
         sym = ""
@@ -717,17 +720,10 @@ async def event_study_skill(event_date: str, symbol: str | None = None,
             elif is_a_share_index_symbol(cand):
                 sym = cand.lower()
             else:
-                code6 = "".join(ch for ch in cand if ch.isdigit())[-6:]
-                if len(code6) == 6:
-                    lowered = cand.lower()
-                    if lowered.startswith(("sh", "sz", "bj")):
-                        sym = lowered[:2] + code6
-                    elif code6.startswith(("50", "51", "52", "56", "58")):
-                        sym = "sh" + code6
-                    elif code6.startswith("15"):
-                        sym = "sz" + code6
-                    else:
-                        sym = code6
+                try:
+                    sym = norm_symbol(cand)
+                except ValueError:
+                    sym = ""
     if not sym:
         return err("必须提供 symbol 或 keyword")
 
@@ -763,6 +759,8 @@ async def event_study_skill(event_date: str, symbol: str | None = None,
         "index_symbol": idx_sym,
         "as_of": bool(as_of),
     }
+    if prediction_cutoff_at:
+        call_args["prediction_cutoff_at"] = prediction_cutoff_at
     result = await execute_skill("event_study", call_args)
     if not result.get("ok"):
         return result
@@ -777,6 +775,8 @@ async def event_study_skill(event_date: str, symbol: str | None = None,
              "event_date": event_date, "window_days": window_days,
              "benchmark": idx_sym,
              "as_of_mode": True,
+             "information_cutoff": es_summary.get("information_cutoff") or "previous_trading_close",
+             "information_cutoff_date": es_summary.get("information_cutoff_date"),
              "signal_event_day_change_pct": es_summary.get("event_day_change_pct"),
              "signal_event_day_idx_change_pct": es_summary.get("event_day_idx_change_pct"),
              "signal_event_day_ar_pct": es_summary.get("event_day_ar_pct"),

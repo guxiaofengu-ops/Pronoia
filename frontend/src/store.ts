@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, streamChat, StreamAbortedError } from "./api";
+import { api, streamChat, startChatDetached, StreamAbortedError } from "./api";
 import type {
   AgentMeta,
   ArenaItem,
@@ -23,8 +23,8 @@ import { uid } from "./utils";
 
 /* ---------------- logic library 持久化 ---------------- */
 
-const LOGIC_KEY = "fever.logic_library.v1";
-const UI_KEY = "fever.ui.v1";
+const LOGIC_KEY = "pronoia.logic_library.v1";
+const UI_KEY = "pronoia.ui.v1";
 
 interface UIPrefs {
   rightOpen?: boolean;
@@ -39,7 +39,7 @@ interface UIPrefs {
 
 function loadUIPrefs(): UIPrefs {
   try {
-    const raw = localStorage.getItem(UI_KEY);
+    const raw = localStorage.getItem(UI_KEY) ?? localStorage.getItem("fever.ui.v1");
     if (!raw) return {};
     return JSON.parse(raw) as UIPrefs;
   } catch {
@@ -57,7 +57,7 @@ function saveUIPrefs(p: UIPrefs) {
 
 function loadLogicLibrary(): LogicItem[] {
   try {
-    const raw = localStorage.getItem(LOGIC_KEY);
+    const raw = localStorage.getItem(LOGIC_KEY) ?? localStorage.getItem("fever.logic_library.v1");
     if (!raw) return [];
     const j = JSON.parse(raw) as LogicItem[];
     return Array.isArray(j) ? j : [];
@@ -243,11 +243,121 @@ export function partsFromHistory(m: HistoryMessage): Part[] {
 
 /* ---------------- store ---------------- */
 
-/** P0 视图：chat（研究工作台）/ backtest-list（回测列表页）/ backtest-detail（回测详情页）
- *  arena-list（Arena 比对列表）/ arena-detail（Arena 比对详情）
+/**
+ * 页面路由的 store 表示。`backtest-list` 保留为旧代码兼容别名，
+ * setView 会将它统一导航到回测首页“运行记录”。
  */
-export type ViewName = "chat" | "backtest-list" | "backtest-detail" | "arena-list" | "arena-detail";
+export type ViewName =
+  | "simulation-workspace"
+  | "chat"
+  | "backtest-event"
+  | "backtest-quant"
+  | "backtest-runs"
+  | "backtest-list"
+  | "backtest-model-lab"
+  | "backtest-data"
+  | "backtest-detail"
+  | "arena-list"
+  | "arena-detail"
+  | "prospective-list"
+  | "prospective-detail";
 
+interface RouteSnapshot {
+  view: Exclude<ViewName, "backtest-list">;
+  currentBTRunId: string | null;
+  currentArenaId: string | null;
+  currentProspectiveRunId: string | null;
+}
+
+function routeFromLocation(): RouteSnapshot {
+  if (typeof window === "undefined") {
+    return {
+      view: "chat",
+      currentBTRunId: null,
+      currentArenaId: null,
+      currentProspectiveRunId: null,
+    };
+  }
+  const path = window.location.pathname.replace(/\/+$/, "") || "/";
+  const btDetail = path.match(/^\/backtest\/runs\/([^/]+)$/);
+  if (btDetail) {
+    return {
+      view: "backtest-detail",
+      currentBTRunId: decodeURIComponent(btDetail[1]),
+      currentArenaId: null,
+      currentProspectiveRunId: null,
+    };
+  }
+  const arenaDetail = path.match(/^\/arena\/([^/]+)$/);
+  if (arenaDetail) {
+    return {
+      view: "arena-detail",
+      currentBTRunId: null,
+      currentArenaId: decodeURIComponent(arenaDetail[1]),
+      currentProspectiveRunId: null,
+    };
+  }
+  const prospectiveDetail = path.match(/^\/prospective\/([^/]+)$/);
+  if (prospectiveDetail) {
+    return {
+      view: "prospective-detail",
+      currentBTRunId: null,
+      currentArenaId: null,
+      currentProspectiveRunId: decodeURIComponent(prospectiveDetail[1]),
+    };
+  }
+  const views: Record<string, RouteSnapshot["view"]> = {
+    "/backtest/event": "backtest-event",
+    "/backtest/quant": "backtest-quant",
+    "/backtest/runs": "backtest-runs",
+    "/backtest/model-lab": "backtest-model-lab",
+    "/backtest/data": "backtest-data",
+    "/backtest": "backtest-runs",
+    "/arena": "arena-list",
+    "/prospective": "prospective-list",
+    "/simulations": "simulation-workspace",
+  };
+  return {
+    view: views[path] ?? "chat",
+    currentBTRunId: null,
+    currentArenaId: null,
+    currentProspectiveRunId: null,
+  };
+}
+
+function pathForView(
+  view: ViewName,
+  state: Pick<RouteSnapshot, "currentBTRunId" | "currentArenaId" | "currentProspectiveRunId">,
+): string {
+  const normalized = view === "backtest-list" ? "backtest-runs" : view;
+  const paths: Partial<Record<ViewName, string>> = {
+    chat: "/",
+    "simulation-workspace": "/simulations",
+    "backtest-event": "/backtest/event",
+    "backtest-quant": "/backtest/quant",
+    "backtest-runs": "/backtest/runs",
+    "backtest-model-lab": "/backtest/model-lab",
+    "backtest-data": "/backtest/data",
+    "arena-list": "/arena",
+    "prospective-list": "/prospective",
+  };
+  if (normalized === "backtest-detail" && state.currentBTRunId) {
+    return `/backtest/runs/${encodeURIComponent(state.currentBTRunId)}`;
+  }
+  if (normalized === "arena-detail" && state.currentArenaId) {
+    return `/arena/${encodeURIComponent(state.currentArenaId)}`;
+  }
+  if (normalized === "prospective-detail" && state.currentProspectiveRunId) {
+    return `/prospective/${encodeURIComponent(state.currentProspectiveRunId)}`;
+  }
+  return paths[normalized] ?? "/";
+}
+
+function pushRoute(path: string, replace = false) {
+  if (typeof window === "undefined") return;
+  if (window.location.pathname === path) return;
+  window.history[replace ? "replaceState" : "pushState"]({}, "", path);
+}
 interface FeverState {
   cases: CaseItem[];
   currentCaseId: string | null;
@@ -293,6 +403,7 @@ interface FeverState {
   arenaLoading: boolean;
   /** Arena 详情页当前 arena_id */
   currentArenaId: string | null;
+  currentProspectiveRunId: string | null;
 
   init: () => Promise<void>;
   sendMessage: (text: string, mode?: Mode, agent?: string) => Promise<void>;
@@ -343,6 +454,8 @@ interface FeverState {
 
   /* ---- Backtest 方法 ---- */
   setView: (v: ViewName) => void;
+  /** 响应 popstate，只同步 store，不再写入 history。 */
+  syncRouteFromLocation: () => void;
   /** 进入某个回测详情页（自动 setView("backtest-detail")） */
   openBTDetail: (runId: string) => void;
   /** 返回回测列表或 chat 工作台 */
@@ -361,11 +474,45 @@ interface FeverState {
   loadArenas: (force?: boolean) => Promise<ArenaItem[]>;
   /** 列表里单独更新某条 Arena */
   patchArena: (arenaId: string, patch: Partial<ArenaItem>) => void;
+  openProspectiveDetail: (runId: string) => void;
+  backFromProspectiveDetail: () => void;
 }
 
 let abortCtl: AbortController | null = null;
 /** 当前流式所属 case / message / question：logic_items 事件入库存档时使用 */
 let currentCtx: { caseId: string; messageId: string; question: string } | null = null;
+
+/**
+ * 公网预览网关（*.traecontent.cn 等）会间歇性掐断 SSE 长连接，浏览器网络层
+ * 自动打 ERR_INCOMPLETE_CHUNKED_ENCODING 红错，代码无法抑制。治本方案：
+ * 检测到页面运行在预览网关上时，默认完全不走 SSE——对话直接 detach+轮询，
+ * 从第一次请求起就不存在长连接，该错误从根上消失。
+ * 本地开发（localhost）不受影响，保持 SSE 流式。
+ * 手动覆盖：sessionStorage["pronoia.prefer_polling"]="1"/"0"。
+ */
+const _POLL_KEY = "pronoia.prefer_polling";
+const _isPreviewGateway = (() => {
+  try {
+    const h = window.location.hostname;
+    if (h === "localhost" || h === "127.0.0.1" || h === "[::1]") return false;
+    // 非本机地址一律按不可信网关处理（预览代理、内网穿透、反向代理同理）
+    return true;
+  } catch {
+    return false;
+  }
+})();
+let preferPolling = (() => {
+  try {
+    const v = sessionStorage.getItem(_POLL_KEY);
+    if (v === "1") return true;
+    if (v === "0") return false;
+  } catch { /* ignore */ }
+  return _isPreviewGateway;
+})();
+function enablePreferPolling() {
+  preferPolling = true;
+  try { sessionStorage.setItem(_POLL_KEY, "1"); } catch { /* ignore */ }
+}
 
 /** live-log 的 EventSource 连接（liveLogOpen=true 时建立，关闭时 close） */
 let liveLogEs: EventSource | null = null;
@@ -382,8 +529,102 @@ if (typeof window !== "undefined") {
   window.addEventListener("beforeunload", silentAbort, { capture: true });
 }
 
+/**
+ * 断流挽回：公网链路把 SSE 掐断时，后端已把本轮已产出内容落库（含部分
+ * 内容与 tool_trace）。识别条件：最后一条是 assistant，且其前一条正好是
+ * 本轮发出的 user 消息（内容逐字匹配）。要求已有正文内容才直接收尾；
+ * 只有 tool_trace 没正文（典型：router 还在 thinking/调工具早期被掐）时
+ * 返回 null 走自动重试，避免出现"无正文又无错误标记"的假完成消息。
+ */
+async function salvageFromServer(caseId: string, question: string) {
+  try {
+    const d = await api.caseDetail(caseId);
+    const msgs = d.messages ?? [];
+    const last = msgs[msgs.length - 1];
+    const prev = msgs[msgs.length - 2];
+    if (!last || last.role !== "assistant") return null;
+    if (!prev || prev.role !== "user" || prev.content !== question) return null;
+    if (!(last.content ?? "").trim()) return null;
+    const parts = partsFromHistory(last);
+    return { last, parts, artifacts: d.artifacts ?? [] };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 断流轮询挽回：公网链路把 SSE 掐断时，后端生成是独立 Task（detached），
+ * 仍在后台继续执行并持续把 content / tool_trace 落库。此时前端不再发起
+ * 新的生成请求（避免重复生成），而是改为周期性轮询 caseDetail 取回已落库
+ * 进度，直到后端该轮生成完成（内容稳定）或超过保护窗口。
+ *
+ * 判完成条件：assistant 行已有正文，且连续 3 次轮询（content 长度 +
+ * tool_trace 长度）都不再变化。判"仍在生成"：快照仍在增长 → 继续轮询。
+ * 返回 null 表示轮询超时 / 该行不是本轮问题 → 交由上层走重试兜底。
+ */
+async function pollUntilComplete(
+  caseId: string,
+  question: string,
+  onProgress?: (parts: Part[], content: string, artifacts: Artifact[]) => void,
+  signal?: AbortSignal,
+) {
+  const POLL_MS = 1500;
+  const MAX_MS = 6 * 60 * 1000; // 保护窗口 6 分钟（team 模式可能更久）
+  const STABLE_ROUNDS = 3;
+  const start = Date.now();
+  let lastKey = "";
+  let stable = 0;
+
+  const traceLen = (t: unknown) => {
+    if (Array.isArray(t)) return t.length;
+    if (typeof t === "string" && t.trim()) {
+      try { return (JSON.parse(t) as unknown[]).length; } catch { return 0; }
+    }
+    return 0;
+  };
+
+  for (;;) {
+    if (signal?.aborted) return null;
+    if (Date.now() - start > MAX_MS) return null;
+    try {
+      const d = await api.caseDetail(caseId);
+      const msgs = d.messages ?? [];
+      const last = msgs[msgs.length - 1];
+      const prev = msgs[msgs.length - 2];
+      if (!last || last.role !== "assistant") { await sleep(POLL_MS); continue; }
+      if (!prev || prev.role !== "user" || prev.content !== question) { await sleep(POLL_MS); continue; }
+      const content = (last.content ?? "").trim();
+      const artifacts = d.artifacts ?? [];
+      const key = `${content.length}:${traceLen(last.tool_trace)}`;
+      if (onProgress) {
+        // 无论正文是否已流出，都把已落库的 tool_trace/正文/产物实时映射到 UI。
+        // 生成尚在 thinking/调工具阶段时 content 为空，但 tool_trace 在增长，
+        // 必须同步到界面，否则断流后用户会看到"卡住"的假死状态。
+        onProgress(partsFromHistory(last), last.content ?? "", artifacts);
+      }
+      if (key === lastKey) {
+        stable++;
+        if (content && stable >= STABLE_ROUNDS) {
+          return { last, parts: partsFromHistory(last), artifacts: d.artifacts ?? [] };
+        }
+      } else {
+        stable = 0;
+        lastKey = key;
+      }
+    } catch {
+      // 单次轮询失败忽略，下一轮再试（网络抖动不应该终止整个挽回）
+    }
+    await sleep(POLL_MS);
+  }
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((r) => setTimeout(r, ms));
+}
+
 export const useStore = create<FeverState>((set, get) => {
   const prefs = loadUIPrefs();
+  const initialRoute = routeFromLocation();
   const initialTeamMembersSet =
     prefs.teamMembersSet === true ||
     (prefs.teamMembersSet == null && Object.prototype.hasOwnProperty.call(prefs, "teamMembers"));
@@ -552,15 +793,16 @@ export const useStore = create<FeverState>((set, get) => {
     liveLogOpen: false,
 
     /* ---- Backtest 默认值 ---- */
-    view: "chat",
-    currentBTRunId: null,
+    view: initialRoute.view,
+    currentBTRunId: initialRoute.currentBTRunId,
     btRuns: [],
     btRunsLoading: false,
 
     /* ---- Arena 默认值 ---- */
     arenaItems: [],
     arenaLoading: false,
-    currentArenaId: null,
+    currentArenaId: initialRoute.currentArenaId,
+    currentProspectiveRunId: initialRoute.currentProspectiveRunId,
 
     init: async () => {
       if (get().initialized) return;
@@ -646,17 +888,132 @@ export const useStore = create<FeverState>((set, get) => {
 
       abortCtl = new AbortController();
       currentCtx = { caseId, messageId: asstMsg.id, question: content };
-      try {
-        await streamChat(
-          { case_id: caseId, message: content, mode: useMode,
-            agent: useAgent,
-            team_members: useMode === "team" ? get().teamMembers : undefined },
-          { onEvent: handleEvent, signal: abortCtl.signal },
-        );
-        // 流正常结束但未收到 done/error 时兜底收尾
+
+      // 浏览器到预览网关的公网链路可能间歇性掐断长连接（沙箱内部链路已验证
+      // 无限制）。后端生成是独立 Task（detached），断连不影响生成落库。
+      // 两种通道：
+      //   A) SSE 流式（默认，本地/稳定链路）：实时推送 token
+      //   B) detach + 轮询（本会话发生过断流后自动切换）：POST 立即返回，
+      //      前端轮询已落库进度——全程无长连接，不会再触发网关掐流红错
+      let streamError: unknown = null;
+
+      const chatBody = {
+        case_id: caseId,
+        message: content,
+        mode: useMode,
+        agent: useAgent,
+        team_members: useMode === "team" ? get().teamMembers : undefined,
+      };
+      const progressSync = (parts: Part[], textContent: string, polledArtifacts: Artifact[]) => {
+        patchPending((m) => ({ ...m, parts, content: textContent }));
+        // 轮询期间产物也实时同步到右栏（SSE 模式下是 artifact 事件即时推送的）
+        set({ artifacts: sortArtifacts(polledArtifacts) });
+      };
+      const applyPolled = (polled: NonNullable<Awaited<ReturnType<typeof pollUntilComplete>>>) => {
+        finalizePending((m) => ({
+          ...m,
+          id: polled.last.id,
+          content: polled.last.content,
+          parts: polled.parts,
+        }));
+        set({ artifacts: sortArtifacts(polled.artifacts ?? []) });
+      };
+
+      if (preferPolling) {
+        // ---- 通道 B：detach + 轮询 ----
+        try {
+          await startChatDetached(chatBody);
+          const polled = await pollUntilComplete(caseId, content, progressSync, abortCtl.signal);
+          if (polled) {
+            applyPolled(polled);
+            streamError = null;
+          } else if (abortCtl.signal.aborted) {
+            streamError = new StreamAbortedError();
+          } else {
+            streamError = new Error("生成超时，请点击重新生成");
+          }
+        } catch (e) {
+          streamError = e;
+        }
+      } else {
+      // ---- 通道 A：SSE 流式，断流后自动降级为轮询 ----
+      const attemptStream = async () => {
+        abortCtl = new AbortController();
+        currentCtx = { caseId, messageId: asstMsg.id, question: content };
+        await streamChat(chatBody, { onEvent: handleEvent, signal: abortCtl.signal });
         if (get().streaming) finalizePending();
+      };
+
+      try {
+        await attemptStream();
+        streamError = null;
       } catch (e) {
+        streamError = e;
         if (e instanceof StreamAbortedError) {
+          // 用户主动停止 / 页面隐藏：不做轮询挽回
+        } else {
+          // 断流：本会话后续消息改用 detach+轮询，不再触碰长连接
+          enablePreferPolling();
+          // 后端 detached 生成仍在跑，改为轮询订阅已落库进度。
+          // 先在 UI 上明确提示，避免用户在无反馈期间误以为卡死。
+          patchPending((m) => ({
+            ...m,
+            parts: [
+              ...(m.parts ?? []),
+              {
+                type: "agent_step",
+                phase: "reconnecting",
+                agent: "system",
+                note: "连接中断，正在从服务器同步生成进度（生成在后台继续，不会丢失）…",
+              } as Part,
+            ],
+          }));
+          const polled = await pollUntilComplete(
+            caseId,
+            content,
+            progressSync,
+            abortCtl?.signal ?? undefined,
+          );
+          if (polled) {
+            applyPolled(polled);
+            streamError = null;
+          } else if (abortCtl?.signal.aborted) {
+            streamError = new StreamAbortedError();
+          } else {
+            // 轮询也没拿到结果（生成任务异常）：兜底重试一次完整生成
+            patchPending((m) => ({ ...m, parts: [], content: "" }));
+            await sleep(1200);
+            try {
+              await startChatDetached(chatBody);
+              const retried = await pollUntilComplete(caseId, content, progressSync, abortCtl.signal);
+              if (retried) {
+                applyPolled(retried);
+                streamError = null;
+              } else {
+                streamError = new Error("生成超时，请点击重新生成");
+              }
+            } catch (e2) {
+              streamError = e2;
+              if (!(e2 instanceof StreamAbortedError)) {
+                const salvaged = await salvageFromServer(caseId, content);
+                if (salvaged) {
+                  finalizePending((m) => ({
+                    ...m,
+                    id: salvaged.last.id,
+                    content: salvaged.last.content,
+                    parts: salvaged.parts,
+                  }));
+                  set({ artifacts: sortArtifacts(salvaged.artifacts ?? []) });
+                  streamError = null;
+                }
+              }
+            }
+          }
+        }
+      }
+      }
+      if (streamError !== null) {
+        if (streamError instanceof StreamAbortedError) {
           // 页面隐藏/切 tab/关 preview 触发的 abort：不写"已停止生成"，让用户无感
           const silent = document.visibilityState === "hidden";
           if (!silent) {
@@ -668,13 +1025,12 @@ export const useStore = create<FeverState>((set, get) => {
           finalizePending((m) => ({
             ...m,
             error: true,
-            errorMessage: `请求失败：${e instanceof Error ? e.message : String(e)}`,
+            errorMessage: `请求失败：${streamError instanceof Error ? streamError.message : String(streamError)}`,
           }));
         }
-      } finally {
-        abortCtl = null;
-        currentCtx = null;
       }
+      abortCtl = null;
+      currentCtx = null;
     },
 
     stop: () => {
@@ -1085,17 +1441,40 @@ export const useStore = create<FeverState>((set, get) => {
     setView: (v) => {
       // 切页面前如果 chat 在 streaming，则先停掉，避免挂起的 SSE 泄漏
       if (v !== "chat" && get().streaming) get().stop();
-      set({ view: v });
+      const view = v === "backtest-list" ? "backtest-runs" : v;
+      const next = {
+        view,
+        currentBTRunId: view === "backtest-detail" ? get().currentBTRunId : null,
+        currentArenaId: view === "arena-detail" ? get().currentArenaId : null,
+        currentProspectiveRunId:
+          view === "prospective-detail" ? get().currentProspectiveRunId : null,
+      };
+      set(next);
+      pushRoute(pathForView(view, next));
+    },
+
+    syncRouteFromLocation: () => {
+      const route = routeFromLocation();
+      if (route.view !== "chat" && get().streaming) get().stop();
+      set(route);
     },
 
     openBTDetail: (runId) => {
       if (get().streaming) get().stop();
-      set({ view: "backtest-detail", currentBTRunId: runId });
+      const next = {
+        view: "backtest-detail" as const,
+        currentBTRunId: runId,
+        currentArenaId: null,
+        currentProspectiveRunId: null,
+      };
+      set(next);
+      pushRoute(pathForView(next.view, next));
     },
 
     backFromBTDetail: () => {
       // 详情页返回列表页；列表数据以最新 DB 为准（详情页运行期间的进度不再向 store 双写）
-      set({ view: "backtest-list", currentBTRunId: null });
+      set({ view: "backtest-runs", currentBTRunId: null });
+      pushRoute("/backtest/runs");
       void get().loadBTRuns(true);
     },
 
@@ -1124,11 +1503,19 @@ export const useStore = create<FeverState>((set, get) => {
 
     openArenaDetail: (arenaId) => {
       if (get().streaming) get().stop();
-      set({ view: "arena-detail", currentArenaId: arenaId });
+      const next = {
+        view: "arena-detail" as const,
+        currentArenaId: arenaId,
+        currentBTRunId: null,
+        currentProspectiveRunId: null,
+      };
+      set(next);
+      pushRoute(pathForView(next.view, next));
     },
 
     backFromArenaDetail: () => {
       set({ view: "arena-list", currentArenaId: null });
+      pushRoute("/arena");
       void get().loadArenas(true);
     },
 
@@ -1149,6 +1536,23 @@ export const useStore = create<FeverState>((set, get) => {
       set((s) => ({
         arenaItems: s.arenaItems.map((a) => (a.id === arenaId ? { ...a, ...patch } : a)),
       }));
+    },
+
+    openProspectiveDetail: (runId) => {
+      if (get().streaming) get().stop();
+      const next = {
+        view: "prospective-detail" as const,
+        currentProspectiveRunId: runId,
+        currentBTRunId: null,
+        currentArenaId: null,
+      };
+      set(next);
+      pushRoute(pathForView(next.view, next));
+    },
+
+    backFromProspectiveDetail: () => {
+      set({ view: "prospective-list", currentProspectiveRunId: null });
+      pushRoute("/prospective");
     },
   };
 });

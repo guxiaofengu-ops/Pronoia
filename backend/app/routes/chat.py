@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import time
+from contextlib import suppress
 from typing import AsyncIterator
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from .. import config, db
 from ..agents.roster import AGENTS, get_agent, system_prompt
 from ..agents.team import run_team
-from ..llm import complete_text, run_agent
+from ..llm import complete_text, friendly_runtime_error, resolve_runtime_target, run_agent, runtime_target_context
 from ..schemas import ChatRequest, sse
+from .simulations import StartSimulationRequest, start_simulation_service
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -26,114 +31,451 @@ def _history_for_llm(case_id: str) -> list[dict]:
     return out
 
 
-async def _gen_title(question: str) -> str:
+def fallback_title(question: str) -> str:
     import re
+    return re.sub(r"\s+", "", question or "")[:20] or "未命名研究"
 
-    fallback = re.sub(r"\s+", "", question or "")[:15] or "未命名研究"
+
+async def _gen_title(question: str) -> str:
+    fallback = fallback_title(question)
     try:
-        title = await complete_text(
+        title = await asyncio.wait_for(complete_text(
             "你是标题生成器。用不超过15个字的中文概括用户的研究问题，只输出标题本身，不要标点收尾。",
             question[:300],
             max_tokens=800,  # reasoning 模型会消耗部分预算在思考上，给足余量
-        )
+        ), timeout=10)
         title = (title or "").strip().strip("「」\"'。 \n")
+        if not title:
+            print("TITLE fallback reason=empty_content", flush=True)
         return title[:20] or fallback
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        print(f"TITLE fallback reason={type(exc).__name__}", flush=True)
         return fallback
 
 
-async def _chat_stream(req: ChatRequest) -> AsyncIterator[str]:
+_TITLE_TASKS: set[asyncio.Task] = set()
+
+
+async def _improve_title(case_id: str, question: str, fallback: str) -> None:
+    title = await _gen_title(question)
+    # Only improve our own fallback; never overwrite a user-supplied title.
+    try:
+        with db._lock:
+            db._get_conn().execute("UPDATE cases SET title=? WHERE id=? AND title=?", (title, case_id, fallback))
+            db._get_conn().commit()
+    except Exception as exc:
+        print(f"TITLE save_failed reason={type(exc).__name__}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Detached generation: 公网预览网关会间歇性掐断 SSE 长连接（浏览器报
+# ERR_INCOMPLETE_CHUNKED_ENCODING）。生成任务不能跟随连接一起死：
+# _run_chat 作为独立 asyncio.Task 运行，SSE 包装器只是它的一个"订阅者"。
+# 客户端断连后任务继续执行并落库，前端通过 /chat/status 轮询取回结果。
+# ---------------------------------------------------------------------------
+
+# case_id -> 正在生成的任务（同一 case 同时只允许一条活跃生成）
+_ACTIVE_RUNS: dict[str, "asyncio.Task[None]"] = {}
+_ACTIVE_DETAILS: dict[str, dict] = {}
+
+_STOP = object()  # 队列结束哨兵
+
+
+async def _run_chat(req: ChatRequest, queue: "asyncio.Queue") -> None:
+    """执行一次完整生成；事件写入 queue（订阅者已断开时自动丢弃）。
+
+    该函数在独立 Task 中运行：浏览器断连只影响 SSE 订阅者，不影响本任务。
+    """
     case_id = req.case_id
     case = db.get_case(case_id) if case_id else None
     if case is None:
         case = db.create_case()
     case_id = case["id"]
 
+    def emit(event: dict) -> None:
+        try:
+            queue.put_nowait(sse(event))  # type: ignore[arg-type]
+        except asyncio.QueueFull:
+            pass  # 订阅者断开或积压：落库才是真相源，事件可丢
+
     # 1) 落库 user message；上下文取最近 12 条（含本条）
+    #    断流重试签名：尾部正好是 [user(同文本), assistant(空)] 时，
+    #    复用该 assistant 行，不再追加重复的 user 消息。
+    msgs = db.list_messages(case_id, limit=3)
+    retry_tail = (
+        len(msgs) >= 2
+        and msgs[-1]["role"] == "assistant"
+        and not (msgs[-1].get("content") or "").strip()
+        and msgs[-2]["role"] == "user"
+        and (msgs[-2].get("content") or "") == req.message
+    )
     is_first = db.count_messages(case_id, role="user") == 0
-    db.add_message(case_id, role="user", content=req.message)
+    if not retry_tail:
+        db.add_message(case_id, role="user", content=req.message)
+    if case.get("title") == "新研究":
+        title = fallback_title(req.message)
+        db.update_case_title(case_id, title)
+        emit({"type": "case_title", "case_id": case_id, "title": title})
     history = _history_for_llm(case_id)
 
     message_id = db.new_id()
     state = {"content": "", "tool_trace": [], "rounds": 0}
+    created_graphs: list[dict] = []
+    artifact_cache: dict[str, dict] = {}
+    # Explicit layout marker distinguishes new traces from legacy body-only history.
+    persisted_trace: list[dict] = [{"type": "stream_layout", "version": 1}]
+    trace_revision = 0
+    record_agent = req.agent if req.mode == "agent" and req.agent else "router"
+    last_checkpoint = 0.0
+    last_snapshot: tuple[int, ...] = (-1, -1, -1)
+    checkpoint_task: asyncio.Task | None = None
+    stream_completed = False
 
-    async def artifact_store(kind: str, title: str, payload):
-        return await asyncio.to_thread(
-            db.add_artifact, case_id, message_id, kind, title, payload
+    # Create the assistant row before any long-running work. Artifacts created
+    # during streaming now always refer to a durable message, even if the
+    # browser disconnects or the async generator is cancelled.
+    if retry_tail:
+        # 重试复用上一轮留下的空 assistant 行，避免累积 [user, 空] 垃圾对
+        message_id = msgs[-1]["id"]
+    else:
+        db.add_message(
+            case_id,
+            role="assistant",
+            agent=record_agent,
+            content="",
+            message_id=message_id,
         )
 
-    yield sse({"type": "meta", "case_id": case_id, "mode": req.mode, "agent": req.agent,
-               "team_members": req.team_members})
-    try:
-        if req.mode == "team":
-            # team 模式：history 传给 synthesize；问题原文作为规划输入
-            hist_for_team = history[:-1] if history else []  # 排除当前 user 消息
-            async for ev in run_team(req.message, hist_for_team, state, artifact_store,
-                                     team_members=req.team_members):
-                yield sse(ev)
-        else:
-            # mode == "agent" | "auto"：单 Agent 工具循环
-            # 优先级：req.agent → "router"（向后兼容）
-            agent_id = (req.agent or "").strip() or "router"
-            agent_def = get_agent(agent_id)
-            if agent_def is None:
-                valid = ", ".join(sorted(AGENTS.keys()))
-                yield sse({"type": "error",
-                           "message": f"未知 Agent「{agent_id}」。可用: {valid}"})
-                return
-            messages = [{"role": "system", "content": system_prompt(agent_id)}] + history
-            async for ev in run_agent(agent_id, messages, agent_def=agent_def,
-                                      state=state, artifact_store=artifact_store,
-                                      max_rounds=config.AUTO_MAX_ROUNDS):
-                yield sse(ev)
+    def remember_event(event: dict) -> None:
+        nonlocal trace_revision
+        from ..research_stream import finish_rounds, remember_stream_event
+        trace_revision += 1
+        event_type = str(event.get("type") or "")
+        if remember_stream_event(persisted_trace, event):
+            return
+        if event_type == "agent_step" and event.get("phase") == "agent_done":
+            finish_rounds(persisted_trace, agent=event.get("agent"))
+        if event_type not in {
+            "tool_call", "tool_result", "artifact", "agent_step", "logic_items"
+        }:
+            return
+        if event_type == "artifact":
+            artifact = event.get("artifact") or {}
+            persisted_trace.append({
+                "type": "artifact",
+                "agent": event.get("agent"),
+                "artifact_id": artifact.get("id"),
+                "kind": artifact.get("kind"),
+                "title": artifact.get("title"),
+            })
+            return
+        persisted_trace.append(dict(event))
 
-        # 2) 落库 assistant message（content + tool_trace JSON）
-        # agent 模式下记录实际调用的 agent_id
-        record_agent = req.agent if req.mode == "agent" and req.agent else "router"
-        db.add_message(case_id, role="assistant", agent=record_agent,
-                       content=state["content"], tool_trace=state["tool_trace"] or None,
-                       message_id=message_id)
+    async def flush_checkpoint_after(delay: float) -> None:
+        await asyncio.sleep(delay)
+        await checkpoint(force=True)
+
+    async def checkpoint(*, force: bool = False) -> None:
+        nonlocal last_checkpoint, last_snapshot, checkpoint_task
+        # Round channels/status are updated in place; revision also covers a
+        # reasoning-only delta or end event with no body/trace length change.
+        snapshot = (len(state.get("content") or ""), len(persisted_trace), trace_revision)
+        now = time.monotonic()
+        if snapshot == last_snapshot:
+            return
+        if not force and now - last_checkpoint < 0.75:
+            # Flush the trailing burst even if the provider then waits for a
+            # long time. Polling/refresh must see all deltas already received.
+            if checkpoint_task is None or checkpoint_task.done():
+                checkpoint_task = asyncio.create_task(flush_checkpoint_after(0.75 - (now - last_checkpoint)))
+            return
+        db.update_message(
+            message_id,
+            content=state.get("content") or "",
+            tool_trace=persisted_trace or None,
+            agent=record_agent,
+        )
+        last_checkpoint = now
+        last_snapshot = snapshot
+
+    async def artifact_store(kind: str, title: str, payload):
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"kind": kind, "title": title, "payload": payload},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        cached = artifact_cache.get(fingerprint)
+        if cached is not None:
+            return {**cached, "_reused": True}
+        row = await asyncio.to_thread(
+            db.add_artifact, case_id, message_id, kind, title, payload
+        )
+        artifact_cache[fingerprint] = row
+        if kind == "graph":
+            created_graphs.append(row)
+        return row
+
+    detail = _ACTIVE_DETAILS.setdefault(case_id, {"case_id": case_id, "run_id": db.new_id(), "question": req.message, "mode": req.mode, "agent": req.agent})
+    detail["message_id"] = message_id
+    emit({"type": "meta", "case_id": case_id, "message_id": message_id, "run_id": detail["run_id"], "mode": req.mode, "agent": req.agent,
+          "team_members": req.team_members})
+    task = asyncio.current_task()
+    if task is not None:
+        _ACTIVE_RUNS[case_id] = task
+    try:
+        from ..evolution.online import capture_episode, quick_context
+        from ..evolution.runtime import evolution_context, prompt_context
+        # Only promoted, already-cached Genes are read on the latency-sensitive
+        # path.  Official EvoMap selection and cycle receipts run in the
+        # background worker or in the deterministic backtest path.
+        evolution = quick_context(req.message, task_id=f"chat:{case_id}:{message_id}")
+        with evolution_context(evolution.get("genes", []), evolution.get("capsule"),
+                               task_id=evolution.get("task_id", ""), library_hash=evolution.get("library_hash", ""),
+                               receipt=evolution.get("receipt"), rules=evolution.get("rules")):
+            if req.mode == "team":
+                hist_for_team = history[:-1] if history else []
+                handoff_job: dict | None = None
+                handoff_error = ""
+                attempted_graph_ids: set[str] = set()
+                async for ev in run_team(req.message, hist_for_team, state, artifact_store,
+                                         team_members=req.team_members):
+                    remember_event(ev)
+                    await checkpoint(force=ev.get("type") in {"artifact", "agent_step"})
+                    emit(ev)
+                    planned_agents = {str(item.get("agent") or "") for item in state.get("team_plan", [])}
+                    artifact = ev.get("artifact") or {}
+                    graph_id = str(artifact.get("id") or "")
+                    if (handoff_job is None and "predictor" in planned_agents
+                            and artifact.get("kind") == "graph" and graph_id
+                            and graph_id not in attempted_graph_ids):
+                        attempted_graph_ids.add(graph_id)
+                        try:
+                            handoff_job = await asyncio.to_thread(
+                                start_simulation_service, case_id,
+                                StartSimulationRequest(
+                                    source_graph_artifact_id=graph_id,
+                                    question=(artifact.get("payload") or {}).get("question") or req.message,
+                                ),
+                            )
+                            handoff_event = {
+                                "type": "agent_step", "phase": "simulation_started", "agent": "predictor",
+                                "note": "证据图已通过校验，单次多智能体推演已在后台启动。",
+                                "simulation_job_id": handoff_job["id"],
+                            }
+                            state["tool_trace"].append(handoff_event)
+                            remember_event(handoff_event)
+                            await checkpoint(force=True)
+                            emit(handoff_event)
+                        except Exception as error:  # noqa: BLE001
+                            handoff_error = str(error.detail) if isinstance(error, HTTPException) else f"{type(error).__name__}: {error}"
+                planned_agents = {str(item.get("agent") or "") for item in state.get("team_plan", [])}
+                if "predictor" in planned_agents and handoff_job is None:
+                    skipped_event = {
+                        "type": "agent_step", "phase": "simulation_skipped", "agent": "predictor",
+                        "note": ("主 Agent 已派出事件预测员，但本轮没有生成可用证据图，已安全跳过多智能体推演。"
+                                 if not created_graphs else f"推演未能安全启动：{handoff_error or '证据图未通过入口校验'}"),
+                    }
+                    state["tool_trace"].append(skipped_event)
+                    remember_event(skipped_event)
+                    await checkpoint(force=True)
+                    emit(skipped_event)
+            else:
+                agent_id = (req.agent or "").strip() or "router"
+                agent_def = get_agent(agent_id)
+                if agent_def is None:
+                    valid = ", ".join(sorted(AGENTS.keys()))
+                    emit({"type": "error", "message": f"未知 Agent「{agent_id}」。可用: {valid}"})
+                    return
+                messages = [{"role": "system", "content": system_prompt(agent_id) + prompt_context(include_strategies=True)}] + history
+                async for ev in run_agent(agent_id, messages, agent_def=agent_def,
+                                          state=state, artifact_store=artifact_store,
+                                          max_rounds=config.AUTO_MAX_ROUNDS):
+                    remember_event(ev)
+                    await checkpoint(force=ev.get("type") in {"artifact", "tool_result"})
+                    emit(ev)
+
+        # 2) Finalize the durable assistant message.
+        await checkpoint(force=True)
+
+        # Persist the completed input/output pair and enqueue EvoMap work.  A
+        # failed or partial generation is still retained as an episode, but it
+        # is never promoted as a successful reusable strategy.
+        with suppress(Exception):
+            capture_episode(case_id=case_id, message_id=message_id, user_text=req.message,
+                            assistant_text=state.get("content") or "", trace=persisted_trace,
+                            mode=req.mode, model_revision=str(req.agent or ""))
 
         # 3) 首条消息 → 生成 case 标题
         if is_first:
-            title = await _gen_title(req.message)
-            await asyncio.to_thread(db.update_case_title, case_id, title)
-            yield sse({"type": "case_title", "title": title})
+            title_task = asyncio.create_task(_improve_title(case_id, req.message, fallback_title(req.message)))
+            _TITLE_TASKS.add(title_task)
+            title_task.add_done_callback(_TITLE_TASKS.discard)
 
-        yield sse({"type": "done", "case_id": case_id, "message_id": message_id})
+        stream_completed = True
+        emit({"type": "done", "case_id": case_id, "message_id": message_id})
     except asyncio.CancelledError:
-        # 前端断开 / 用户主动停止：尽力保存已产出内容，然后让 ASGI 正常收尾
-        # 不 yield error（连接已断，前端收不到），只落库 + 日志
+        # 用户主动停止（/chat/cancel）：尽力保存已产出内容后退出。
+        # 客户端单纯断开不再走到这里——生成在独立 Task 中继续。
         try:
-            if state["content"] or state["tool_trace"]:
-                err_agent = req.agent if req.mode == "agent" and req.agent else "router"
-                db.add_message(case_id, role="assistant", agent=err_agent,
-                               content=state["content"],
-                               tool_trace=state["tool_trace"] or None,
-                               message_id=message_id)
-        except Exception:  # noqa: BLE001
+            remember_event({"type": "agent_step", "phase": "cancelled", "note": "用户已停止生成，已保留当前研究进度。"})
+            await checkpoint(force=True)
+        except BaseException:  # noqa: BLE001
             pass
-        print(f"CHAT case={case_id} cancelled by client (rounds={state.get('rounds', 0)}, "
+        print(f"CHAT case={case_id} cancelled by user (rounds={state.get('rounds', 0)}, "
               f"content_len={len(state.get('content', ''))})", flush=True)
+        emit({"type": "error", "case_id": case_id, "message": "已停止生成"})
         raise
     except Exception as e:  # noqa: BLE001
-        # 尽力保留已产出内容
+        remember_event({
+            "type": "agent_step",
+            "phase": "interrupted",
+            "note": friendly_runtime_error(e),
+        })
+        emit({"type": "error", "message": friendly_runtime_error(e)})
+    finally:
+        # A final checkpoint preserves partial progress on refresh, tab close,
+        # explicit stop, or server-side cancellation.
         try:
-            if state["content"] or state["tool_trace"]:
-                err_agent = req.agent if req.mode == "agent" and req.agent else "router"
-                db.add_message(case_id, role="assistant", agent=err_agent,
-                               content=state["content"],
-                               tool_trace=state["tool_trace"] or None,
-                               message_id=message_id)
-        except Exception:  # noqa: BLE001
+            if checkpoint_task is not None and not checkpoint_task.done():
+                checkpoint_task.cancel()
+                try:
+                    await checkpoint_task
+                except asyncio.CancelledError:
+                    pass
+            from ..research_stream import finish_rounds
+            finish_rounds(persisted_trace)
+            trace_revision += 1
+            if not stream_completed and not any(
+                item.get("phase") in {"interrupted", "cancelled"} for item in persisted_trace
+            ):
+                remember_event({
+                    "type": "agent_step",
+                    "phase": "interrupted",
+                    "note": "研究连接在完成前结束；以下为已保存的阶段性进展，不能视为完整结论。",
+                })
+            await checkpoint(force=True)
+        except BaseException:  # noqa: BLE001
             pass
-        yield sse({"type": "error", "message": f"{type(e).__name__}: {e}"})
+        # 无论正常结束、出错还是被取消：注销活跃任务并通知订阅者收尾
+        if _ACTIVE_RUNS.get(case_id) is task:
+            del _ACTIVE_RUNS[case_id]
+            _ACTIVE_DETAILS.pop(case_id, None)
+        try:
+            queue.put_nowait(_STOP)  # type: ignore[arg-type]
+        except asyncio.QueueFull:
+            pass
+
+
+_SSE_HEARTBEAT_SECONDS = 4.0
+
+
+async def _chat_stream(req: ChatRequest, queue=None, generation=None) -> AsyncIterator[str]:
+    """SSE 订阅器：生成在独立 Task 中运行，本函数只负责转发 + 心跳。
+
+    客户端断连（网关掐流）只终止本订阅器；_run_chat 继续执行并落库，
+    前端随后通过 GET /chat/status/{case_id} 轮询取回结果。
+    静默超过 4s 时发送 `data: {"type":"ping"}` 保活帧。
+    """
+
+    if queue is None:
+        queue = asyncio.Queue(maxsize=2048)
+        target = resolve_runtime_target()
+        with runtime_target_context(target):
+            generation = asyncio.ensure_future(_run_chat(req, queue))
+    try:
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=_SSE_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                yield 'data: {"type":"ping"}\n\n'
+                continue
+            if event is _STOP:
+                break
+            yield event  # type: ignore[misc]
+    finally:
+        # 不 cancel generation：客户端断开恰恰是 detach 生效的场景。
+        # Task 引用由 _ACTIVE_RUNS 持有，不会被 GC。
+        _ = generation
 
 
 @router.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, detach: bool = False):
+    from ..settings import require_model
+    profile = require_model()
+    from ..model_lab.capabilities import connection_capabilities
+    if connection_capabilities(profile)["tools"]["state"] == "unsupported":
+        raise HTTPException(409, detail={"code": "MODEL_TOOLS_UNSUPPORTED", "message": "此连接未通过工具调用验证，无法用于研究模式；请在设置中验证工具能力或选择其他连接", "settings_url": "/settings/models"})
+    # Reserve synchronously before yielding or creating any message. Navigation
+    # and reconnects never create a second generation for an active research.
+    for case_id, task in list(_ACTIVE_RUNS.items()):
+        if not task.done():
+            raise HTTPException(409, detail={"code": "RESEARCH_BUSY", "message": "已有研究在后台生成，请返回该研究或先停止生成", **_ACTIVE_DETAILS.get(case_id, {"case_id": case_id})})
+    target = resolve_runtime_target()
+    case = db.get_case(req.case_id) if req.case_id else None
+    if case is None:
+        case = db.create_case()
+    req.case_id = case["id"]
+    queue = asyncio.Queue(maxsize=2048)
+    detail = {"case_id": case["id"], "run_id": db.new_id(), "question": req.message, "mode": req.mode, "agent": req.agent}
+    with runtime_target_context(target):
+        generation = asyncio.create_task(_run_chat(req, queue))
+    _ACTIVE_RUNS[case["id"]] = generation
+    _ACTIVE_DETAILS[case["id"]] = detail
+    if detach:
+        return dict(detail)
     return StreamingResponse(
-        _chat_stream(req),
+        _chat_stream(req, queue, generation),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/chat/status")
+def chat_status():
+    return {"runs": [dict(_ACTIVE_DETAILS.get(case_id, {"case_id": case_id})) for case_id, task in list(_ACTIVE_RUNS.items()) if not task.done()]}
+
+
+@router.post("/chat/cancel")
+async def cancel_chat(payload: dict):
+    case_id = str(payload.get("case_id") or "")
+    task = _ACTIVE_RUNS.get(case_id)
+    detail = _ACTIVE_DETAILS.get(case_id) or {}
+    if not task or task.done():
+        return {"ok": True, "cancelled": False}
+    if payload.get("run_id") and payload["run_id"] != detail.get("run_id"):
+        raise HTTPException(409, detail={"code": "RESEARCH_CHANGED", "message": "该研究任务已变化，请刷新后重试"})
+    task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+    finally:
+        if task.done() and _ACTIVE_RUNS.get(case_id) is task:
+            _ACTIVE_RUNS.pop(case_id, None)
+            _ACTIVE_DETAILS.pop(case_id, None)
+    return {"ok": True, "cancelled": True}
+
+
+@router.get("/sse_probe")
+async def sse_probe(seconds: int = 300):
+    """诊断端点：每 2s 发一帧 ping 持续 N 秒，用于测量代理层 SSE 硬超时。"""
+    async def gen() -> AsyncIterator[str]:
+        start = time.time()
+        n = 0
+        while time.time() - start < seconds:
+            n += 1
+            yield 'data: {"type":"ping","n":%d,"t":%.1f}\n\n' % (n, time.time() - start)
+            await asyncio.sleep(2)
+        yield 'data: {"type":"done","frames":%d}\n\n' % n
+    return StreamingResponse(
+        gen(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

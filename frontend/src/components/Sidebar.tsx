@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Beaker, LineChart, MessageSquareText, PanelLeftClose, PanelLeftOpen, Plus, Swords, Terminal, Trash2, Users, Wrench } from "lucide-react";
+import { Beaker, LineChart, MessageSquareText, PanelLeftClose, PanelLeftOpen, Plus, Swords, Terminal, Trash2, Users, Wrench, Radio } from "lucide-react";
 import { relTime, cls } from "../utils";
 import { useStore, ViewName } from "../store";
 import { VERSION } from "../version";
@@ -30,10 +30,14 @@ export default function Sidebar() {
 
   const inBacktestView = view.startsWith("backtest-");
   const inArenaView = view.startsWith("arena-");
-  const inLabView = inBacktestView || inArenaView;
+  const inProspectiveView = view.startsWith("prospective-");
+  const inSimulationView = view === "simulation-workspace";
+  const inLabView = inBacktestView || inArenaView || inProspectiveView || inSimulationView;
   const goView = (v: ViewName) => {
     if (streaming && v !== "chat") return; // 流式中禁止切走
     setView(v);
+    // 实验页面需要宽幅图表与协议配置；进入时收起全局案例栏，回到研究时恢复。
+    setLeftOpen(v === "chat");
   };
 
   const goTab = (t: "skills" | "team" | "logic") => {
@@ -73,10 +77,10 @@ export default function Sidebar() {
         >
           <MessageSquareText size={16} />
         </button>
-        {/* 回测 Run */}
+        {/* 回测中心 */}
         <button
-          onClick={() => goView("backtest-list")}
-          title={inBacktestView ? "回测 Run（当前）" : "切换到回测中心"}
+          onClick={() => goView("backtest-runs")}
+          title={inBacktestView ? "回测中心（当前）" : "切换到回测中心"}
           className={cls(
             "rounded-lg p-2 transition-colors",
             inBacktestView ? "bg-card text-jade shadow-card" : "text-mute hover:bg-card hover:text-ink",
@@ -94,6 +98,26 @@ export default function Sidebar() {
           )}
         >
           <Swords size={16} />
+        </button>
+        <button
+          onClick={() => goView("prospective-list")}
+          title={inProspectiveView ? "前瞻评测（当前）" : "切换到前瞻评测"}
+          className={cls(
+            "rounded-lg p-2 transition-colors",
+            inProspectiveView ? "bg-card text-amber shadow-card" : "text-mute hover:bg-card hover:text-ink",
+          )}
+        >
+          <Radio size={16} />
+        </button>
+        <button
+          onClick={() => goView("simulation-workspace")}
+          title={inSimulationView ? "事件推演（当前）" : "切换到事件推演"}
+          className={cls(
+            "rounded-lg p-2 transition-colors",
+            inSimulationView ? "bg-card text-jade shadow-card" : "text-mute hover:bg-card hover:text-ink",
+          )}
+        >
+          <Users size={16} />
         </button>
         {/* 新研究 */}
         <button
@@ -196,38 +220,60 @@ export default function Sidebar() {
         </button>
       </div>
 
-      {/* 视图切换：研究工作台 ↔ 回测中心 ↔ Arena 比对 */}
+      {/* 统一工作台导航；短标签让五个入口在侧栏内保持等宽。 */}
       <div className="mb-2 px-3.5">
-        <div className="grid grid-cols-3 gap-1 rounded-lg bg-edge/50 p-1">
+        <div className="grid grid-cols-5 gap-1 rounded-lg bg-edge/50 p-1" role="navigation" aria-label="工作台导航">
           <button
             onClick={() => goView("chat")}
             className={cls(
-              "flex items-center justify-center gap-1 rounded-md px-1 py-1.5 text-[11px] font-medium transition-all",
+              "flex min-w-0 flex-col items-center justify-center gap-1 rounded-md px-0.5 py-2 text-[11px] font-medium transition-all",
               !inLabView ? "bg-card text-brand shadow-card" : "text-mute hover:bg-card/60 hover:text-ink",
             )}
           >
-            <MessageSquareText size={11} />
+            <MessageSquareText size={13} />
             研究
           </button>
           <button
-            onClick={() => goView("backtest-list")}
+            onClick={() => goView("backtest-runs")}
             className={cls(
-              "flex items-center justify-center gap-1 rounded-md px-1 py-1.5 text-[11px] font-medium transition-all",
+              "flex min-w-0 flex-col items-center justify-center gap-1 rounded-md px-0.5 py-2 text-[11px] font-medium transition-all",
               inBacktestView ? "bg-card text-jade shadow-card" : "text-mute hover:bg-card/60 hover:text-ink",
             )}
           >
-            <LineChart size={11} />
+            <LineChart size={13} />
             回测
           </button>
           <button
             onClick={() => goView("arena-list")}
             className={cls(
-              "flex items-center justify-center gap-1 rounded-md px-1 py-1.5 text-[11px] font-medium transition-all",
+              "flex min-w-0 flex-col items-center justify-center gap-1 rounded-md px-0.5 py-2 text-[11px] font-medium transition-all",
               inArenaView ? "bg-card text-violet shadow-card" : "text-mute hover:bg-card/60 hover:text-ink",
             )}
           >
-            <Swords size={11} />
+            <Swords size={13} />
             Arena
+          </button>
+          <button
+            onClick={() => goView("prospective-list")}
+            className={cls(
+              "flex min-w-0 flex-col items-center justify-center gap-1 rounded-md px-0.5 py-2 text-[11px] font-medium transition-all",
+              inProspectiveView ? "bg-card text-amber shadow-card" : "text-mute hover:bg-card/60 hover:text-ink",
+            )}
+          >
+            <Radio size={13} />
+            前瞻
+          </button>
+          <button
+            onClick={() => goView("simulation-workspace")}
+            title="事件推演"
+            aria-label="事件推演"
+            className={cls(
+              "flex min-w-0 flex-col items-center justify-center gap-1 rounded-md px-0.5 py-2 text-[11px] font-medium transition-all",
+              inSimulationView ? "bg-card text-jade shadow-card" : "text-mute hover:bg-card/60 hover:text-ink",
+            )}
+          >
+            <Users size={13} />
+            推演
           </button>
         </div>
       </div>

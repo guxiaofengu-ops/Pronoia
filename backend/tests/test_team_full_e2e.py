@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# 屏蔽 FEVER_BT_STRICT_ASOF 等环境变量影响
-os.environ.setdefault("FEVER_BT_FAST", "1")
+# 屏蔽 PRONOIA_BT_STRICT_ASOF 等环境变量影响
+os.environ.setdefault("PRONOIA_BT_FAST", "1")
 
 # 关键：触发 analyzers.py 模块加载，让 @skill decorator 把 6 个新 skill 注册到 REGISTRY。
 # 否则 _route_signals 调用 REGISTRY["announcement_classifier"] 会找不到 handler，信号全空 → 返回 None。
@@ -196,6 +196,11 @@ def _make_us_ma_event() -> dict:
 class TestTeamFullE2E:
     """端到端：engine → run_team → _route_signals → analyzer → synthesize → parser。"""
 
+    @pytest.fixture(autouse=True)
+    def isolate_checkpoints(self, tmp_path):
+        self.ckpt_dir = tmp_path / "checkpoints"
+        self.ckpt_dir.mkdir()
+
     async def _run_with_mock_llm(self, event: dict, expected_direction: str) -> dict:
         """通用 e2e runner。返回 trajectory ckpt 内容（用于断言）。"""
         from app.event_backtest import engine as eng_mod
@@ -256,8 +261,7 @@ class TestTeamFullE2E:
         import app.llm as llm_mod
         import app.agents.team as team_mod
 
-        ckpt_dir = Path(__file__).parent / "_e2e_ckpt"
-        ckpt_dir.mkdir(exist_ok=True)
+        ckpt_dir = self.ckpt_dir
 
         # 调试钩子：拦截 _route_signals 看实际输入输出
         routing_trace: list[dict] = []
@@ -372,11 +376,11 @@ class TestTeamFullE2E:
         routing_events = [t for t in tool_trace if t.get("type") == "signal_routing"]
         assert len(routing_events) == 0
 
-    async def test_e2e_low_confidence_preserves_direction(self):
-        """低 confidence 只描述可靠度，不再覆盖模型给出的方向。"""
+    async def test_e2e_low_confidence_retains_supported_direction(self):
+        """低置信度保持已给出的方向，不伪装成中性观点。"""
         event = _make_cn_ma_event()
         event["event_id"] = "low_conf_gate_e2e"
-        # 构造 confidence=0.55 的最终回答
+        # 构造 confidence=0.45 的最终回答
         from app.event_backtest import engine as eng_mod
         from app.event_backtest.models import EventRecord
 
@@ -392,7 +396,7 @@ class TestTeamFullE2E:
         async def _fake_run_agent(agent_id, messages, *, agent_def, state, artifact_store,
                                   max_rounds=8, emit_thinking=True):
             if agent_id == "router":
-                content = _make_final_answer("up", 0.55, "低置信度案例。")
+                content = _make_final_answer("up", 0.45, "低置信度案例。")
             else:
                 content = "[mock findings]"
             state["content"] += content
@@ -400,7 +404,7 @@ class TestTeamFullE2E:
 
         import app.llm as llm_mod
         import app.agents.team as team_mod
-        ckpt_dir = Path(__file__).parent / "_e2e_ckpt"
+        ckpt_dir = self.ckpt_dir
 
         with patch.object(llm_mod, "get_client", return_value=_FakeClient([])), \
              patch.object(llm_mod, "complete_json", _fake_complete_json), \
@@ -413,6 +417,7 @@ class TestTeamFullE2E:
                 trajectory_ckpt_dir=str(ckpt_dir),
             )
 
-        # 分支 RLVR 0.60 硬闸：confidence=0.55 < 0.60 → direction 强制 neutral
-        assert pred.pred_direction == "neutral"
-        assert pred.confidence == pytest.approx(0.55, abs=0.01)
+        # confidence=0.45 remains a directional prediction.
+        assert pred.pred_direction == "up"
+        assert pred.abstain is False
+        assert pred.confidence == pytest.approx(0.45, abs=0.01)
